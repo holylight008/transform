@@ -1,0 +1,270 @@
+import * as ts from "typescript";
+import * as fs from "fs";
+import { MarkDownTools } from "./MarkDownTools";
+import { NodeInfo } from "./NodeInfo";
+
+const keyTypeJson = require("../src/keyType.json");
+const strctureNode = require("../src/structureNode.json");
+const skipNode = [17, 19, 18, 1, 56, 20, 36, 25, 18, 212, 21, 22, 26, 55, 124, 23,27,29];
+
+function generateDocumentation(filePath: string, options: ts.CompilerOptions): void {
+    const text = fs.readFileSync(filePath, "utf-8");
+    let sourceFile = ts.createSourceFile(filePath, text, ts.ScriptTarget.ES5,/*setParentNodes */true);
+    let resultJson = forEachChild(sourceFile, visit);
+    fs.writeFileSync("classes.json", JSON.stringify(resultJson, undefined, 4));
+    let documents = MarkDownTools.transformSouceFile(resultJson);
+    fs.writeFileSync("document.md", documents);
+    return;
+
+}
+
+
+//递归合并
+function forEachChild(node: ts.Node, execution: (node: ts.Node) => NodeInfo): NodeInfo {
+    let children = node.getChildren();
+    let resultCombine = new NodeInfo();
+
+    //递归合并时标注结构节点类型
+    let sturcturNodeType = strctureNode[node.kind.toString()];
+    if (sturcturNodeType) {
+        resultCombine.currentType = sturcturNodeType;
+    }
+
+
+    for (let i = 0; i < children.length; i++) {
+        //应跳过函数体和各种符号
+        if (skipNode.indexOf(children[i].kind) > -1) {
+            continue;
+        }
+        //执行访问
+        let result = execution(children[i]);
+        //被跳过的节点返回值为空
+        if (result == null) {
+            continue;
+        }
+        if (children[i].getChildren().length != 0
+            && children[i].kind != ts.SyntaxKind.JSDocComment
+            && children[i].kind != ts.SyntaxKind.JSDocParameterTag
+            && children[i].kind != ts.SyntaxKind.ArrayType
+            && children[i].kind != ts.SyntaxKind.PropertyAccessExpression
+            && children[i].kind != ts.SyntaxKind.FirstNode
+            && children[i].kind != ts.SyntaxKind.TypeReference) {
+            //判断是否加入则节点的标准是该节点是否有子，但并非所有子节点都放入了childrenDetails中
+            //比如arrayType这类节点就被优化过，只会返回组合后的一个属性
+            //如果某节点返回多个数据，请保证这个节点含有子节点，否则将进入其他情况，只会记录一个数据
+            if (!resultCombine.childrenDetails) {
+                resultCombine.childrenDetails = [];
+            }
+            resultCombine.childrenDetails.push(result);
+        } else if (result.name) {
+            //形如A.b这类的module名称会被分开
+            if (!resultCombine.name) {
+                resultCombine.name = '';
+            }
+            if (node.kind == ts.SyntaxKind.PropertyAccessExpression ||
+                node.kind == ts.SyntaxKind.FirstNode) {
+                if (i == children.length - 1) {
+                    resultCombine.name += result.name;
+                } else {
+                    resultCombine.name += result.name + ".";
+                }
+            } else {
+                resultCombine.name = result.name;
+            }
+        } else if (result.comment) {
+            //多条注释
+            if (!resultCombine.comments) {
+                resultCombine.comments = [];
+            }
+            resultCombine.comments.push(result.comment);
+        } else if (result.type) {
+            resultCombine.type = result.type;
+        } else if (result.field) {
+            resultCombine.field = result.field;
+        } else if (result.isStatic) {
+            resultCombine.isStatic = result.isStatic;
+        } else if (result.dataType) {
+            //判断是否可选
+            let isChoice = "";
+            if (children[i - 2] && children[i - 2].kind == ts.SyntaxKind.QuestionToken) {
+                isChoice = "?";
+            }
+            //判断是否为数组,
+            if (node.kind == ts.SyntaxKind.ArrayType) {
+                resultCombine.keywordDetails = result.dataType + "[]";
+            }
+            if (children[i].kind == ts.SyntaxKind.ArrayType) {
+                result.dataType = result.keywordDetails;
+            }
+            if (children[i].kind == ts.SyntaxKind.TypeReference) {
+                if (node.kind == ts.SyntaxKind.SyntaxList) {
+                    //转义符是为了MarkDown格式的显示
+                    resultCombine.keywordDetails = "\\<" + result.keywordDetails + ">";
+                } else {
+                    result.dataType = result.keywordDetails;
+                }
+            }
+
+            //判断数据类型是参数、属性还是返回值
+            if (node.kind == ts.SyntaxKind.MethodDeclaration || node.kind == ts.SyntaxKind.MethodSignature || node.kind == ts.SyntaxKind.FunctionType) {
+                resultCombine.returnType = isChoice + result.dataType;
+            } else if (node.kind == ts.SyntaxKind.Parameter) {
+                resultCombine.paramType = isChoice + result.dataType;
+            } else if (node.kind == ts.SyntaxKind.PropertyDeclaration || node.kind == ts.SyntaxKind.PropertySignature) {
+                resultCombine.propertyType = isChoice + result.dataType;
+            }
+        }
+    }
+    return resultCombine;
+}
+
+//逐个递归访问
+function visit(node: ts.Node): NodeInfo {
+
+    let resultCombine = forEachChild(node, visit);
+    let nodeInfo = new NodeInfo();
+    let jsonValue: string = null;
+    if (node.kind == ts.SyntaxKind.ModuleDeclaration) {
+        nodeInfo = resultCombine;
+    } else if (node.kind == ts.SyntaxKind.ModuleBlock) {
+        nodeInfo = resultCombine;
+    } else if (node.kind == ts.SyntaxKind.ClassDeclaration) {
+        //此处未判断是否公有类
+        nodeInfo = resultCombine;
+    } else if (node.kind == ts.SyntaxKind.SyntaxList) {
+        //此处直接返回了SyntaxList，如果只需要结点内容，需要返回SyntaxList.details数组，但需要调整函数返回值
+        nodeInfo = resultCombine;
+    } else if (node.kind == ts.SyntaxKind.InterfaceDeclaration) {
+        nodeInfo = resultCombine;
+    } else if (node.kind == ts.SyntaxKind.PropertyAccessExpression) {
+        nodeInfo = resultCombine;
+    } else if (node.kind == ts.SyntaxKind.PropertyDeclaration || node.kind == ts.SyntaxKind.PropertySignature) {
+        nodeInfo = resultCombine;
+        nodeInfo.type = 'property';
+    } else if (node.kind == ts.SyntaxKind.Constructor) {
+        nodeInfo = resultCombine;
+    } else if (node.kind == ts.SyntaxKind.ExpressionWithTypeArguments) {
+        nodeInfo = resultCombine;
+    } else if (node.kind == ts.SyntaxKind.HeritageClause) {
+        nodeInfo = resultCombine;
+    } else if (node.kind == ts.SyntaxKind.MethodDeclaration) {
+        //既没有参数，也没有属性域
+        if (!resultCombine.childrenDetails) {
+            nodeInfo = resultCombine;
+            nodeInfo.type = 'method';
+        }
+        //有参数但没有属性域 
+        else if (!resultCombine.childrenDetails[0].field) {
+            nodeInfo = resultCombine;
+            //由于public等关键字可能存在于class中，因而在函数声明中规定该结点类型
+            nodeInfo.type = 'method';
+        }
+        //有属性域且为公有
+        else if (resultCombine.childrenDetails[0].field == 'public') {
+            nodeInfo = resultCombine;
+            nodeInfo.type = 'funciton';
+        }
+        //有属性域且为私有或保护
+        else {
+            nodeInfo = null;
+        }
+    } else if (node.kind == ts.SyntaxKind.MethodSignature) {
+        nodeInfo = resultCombine;
+        nodeInfo.type = 'method interface';
+    } else if (node.kind == ts.SyntaxKind.Parameter) {
+        nodeInfo = resultCombine;
+        nodeInfo.type = 'parameter';
+    } else if (node.kind == ts.SyntaxKind.JSDocComment) {
+        //此处将多条子节点注释合并返回,如需jsdoc节点有comment同时还有comments，请采用注释的方法，并修改合并处理函数
+        //使得result.comment合并时考虑同时返回的comments
+        let comment = node as ts.JSDoc;
+        if (comment.comment) {
+            nodeInfo.comment = comment.comment + "\n";
+        }
+        // if(resultCombine.comments){
+        //     nodeInfo.comments=resultCombine.comments;
+        // }
+        if (resultCombine.comments) {
+            //防止出现未定义
+            if (!nodeInfo.comment) {
+                nodeInfo.comment = '';
+            }
+            resultCombine.comments.forEach((comment) => {
+                nodeInfo.comment += comment + '\n';
+            })
+        }
+    } else if (node.kind == ts.SyntaxKind.Identifier) {
+        let name = node as ts.Identifier;
+        nodeInfo.name = name.escapedText.toString();
+    } else if (node.kind == ts.SyntaxKind.ClassKeyword) {
+        nodeInfo.type = 'class';
+    } else if (node.kind == ts.SyntaxKind.NamespaceKeyword) {
+        nodeInfo.type = 'module';
+    } else if (node.kind == ts.SyntaxKind.InterfaceKeyword) {
+        nodeInfo.type = 'interface';
+    } else if (node.kind == ts.SyntaxKind.ConstructorKeyword) {
+        nodeInfo.type = 'constructor';
+    } else if (node.kind == ts.SyntaxKind.PublicKeyword) {
+        nodeInfo.field = 'public';
+    } else if (node.kind == ts.SyntaxKind.PrivateKeyword) {
+        nodeInfo.field = 'private';
+    } else if (node.kind == ts.SyntaxKind.ProtectedKeyword) {
+        nodeInfo.field = 'protect';
+    } else if (node.kind == ts.SyntaxKind.StaticKeyword) {
+        nodeInfo.isStatic = true;
+    } else if (node.kind == ts.SyntaxKind.AbstractKeyword) {
+        nodeInfo.isAbstract = true;
+    } else if (node.kind == ts.SyntaxKind.ExtendsKeyword) {
+        nodeInfo.type = 'extends';
+    } else if (node.kind == ts.SyntaxKind.ImplementsKeyword) {
+        nodeInfo.type = 'implements';
+    } else if ((jsonValue = keyTypeJson[node.kind.toString()]) != null) {
+        if (jsonValue == 'lambda') {
+            nodeInfo = resultCombine;
+            nodeInfo.type = jsonValue;
+        } else {
+            nodeInfo.dataType = jsonValue;
+            if (jsonValue == 'array') {
+                nodeInfo.keywordDetails = resultCombine.keywordDetails;
+            } else if (jsonValue == 'typeReferrence') {
+                if (resultCombine.dataType) {
+                    nodeInfo.dataType = resultCombine.dataType;
+                } else if (resultCombine.name) {
+                    if(resultCombine.childrenDetails){
+                        //此处可能需要循环泛型细节
+                        nodeInfo.keywordDetails=resultCombine.name+resultCombine.childrenDetails[0].keywordDetails;
+                    }else{
+                        nodeInfo.keywordDetails = resultCombine.name;
+                    }
+                }
+            }
+        }
+    } else if (node.kind == ts.SyntaxKind.FirstJSDocTagNode) {
+        let comment = node as ts.JSDocAugmentsTag;
+        if (comment.comment) {
+            nodeInfo.comment = '@' + comment.tagName.escapedText + " " + comment.comment;
+        } else {
+            nodeInfo.comment = '@' + comment.tagName.escapedText;
+        }
+    } else if (node.kind == ts.SyntaxKind.JSDocParameterTag) {
+        let comment = node as ts.JSDocParameterTag;
+        if (comment.comment) {
+            nodeInfo.comment = '@' + comment.tagName.escapedText + " " + resultCombine.name + " " + comment.comment;
+        } else {
+            nodeInfo.comment = '@' + comment.tagName.escapedText + " " + resultCombine.name;
+        }
+    } else if (node.kind == ts.SyntaxKind.FirstNode) {
+        nodeInfo.dataType = resultCombine.name;
+    }
+    else {
+        console.log(node.kind);
+        nodeInfo = null;
+    }
+    return nodeInfo;
+}
+
+generateDocumentation("E:/projects/ast/test/test.ts", {
+    target: ts.ScriptTarget.ES5, module: ts.ModuleKind.CommonJS
+});
+
+
